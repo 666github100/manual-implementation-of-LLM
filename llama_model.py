@@ -1,8 +1,18 @@
+import math
+import inspect
+from dataclasses import dataclass
+from typing import Any, Optional, Tuple
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from transformers import PreTrainedModel, AutoTokenizer
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import PretrainedConfig
 
 class ModelConfig(PretrainedConfig):
     # 定义模型相关的超参数
-    model_type = "Tiny-llama"
+    model_type = "Tiny-llamajh"
     def __init__(
             self,
             dim: int = 768, # 模型维度
@@ -16,6 +26,7 @@ class ModelConfig(PretrainedConfig):
             max_seq_len: int = 512, # 最大序列长度
             dropout: float = 0.0, # dropout概率
             flash_attn: bool = True, # 是否使用Flash Attention
+            pad_token_id: int = 0, # 填充token的ID
             **kwargs,
     ):
         self.dim = dim
@@ -24,6 +35,7 @@ class ModelConfig(PretrainedConfig):
         self.n_kv_heads = n_kv_heads
         self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim
+        self.pad_token_id = pad_token_id
         self.multiple_of = multiple_of
         self.norm_eps = norm_eps
         self.max_seq_len = max_seq_len
@@ -202,6 +214,11 @@ class Attention(nn.Module):
         xq = xq.transpose(1, 2)
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
+
+        # 将一维的注意力掩码attention_Mask转换为4维的键填充掩码key_padding_mask,让模型忽略掉填充的无效 token
+        if attention_mask is not None:
+            key_padding_mask = attention_mask[:, None, None, :].to(dtype=torch.bool)
+
 
         # 根据是否支持Flash Attention，选择实现方式。
         if self.flash:
@@ -393,11 +410,11 @@ class Transformer(PreTrainedModel):
         return self.OUT
 
     
-    @torch.inference_mode()
+    @torch.inference_mode() #表示推理模式,在代码块执行期间,临时禁用梯度计算和某些训练时的检查机制,提高运行速度并减少内存占用
     def generate(self, idx, stop_id=None, max_new_tokens=256, temperature=1.0, top_k=None):
         """
-        给定输入序列 idx（形状为 (bz,seq_len) 的长整型张量），通过多次生成新 token 来完成序列。
-        在 model.eval() 模式下运行。效率较低的采样版本，没有使用键k/v cache。
+        给定输入序列 idx(形状为 (bz,seq_len) 的长整型张量),通过多次生成新token来完成序列。
+        在 model.eval() 模式下运行。效率较低的采样版本,没有使用键k/v cache。
         """
         index = idx.shape[1]
         for _ in range(max_new_tokens):
@@ -410,16 +427,20 @@ class Transformer(PreTrainedModel):
             logits = logits[:, -1, :] # 只保留最后一个时间步的输出
             
             if temperature == 0.0:
-                # 选择最有可能的索引
+                # 选择最有可能的索引,贪婪解码
                 _, idx_next = torch.topk(logits, k=1, dim=-1)
+                # torch.topk()快速找出Tensor中最大或最小的k个元素及其对应的索引
             else:
+                # 温度缩放，增加随机性，temperature越高，生成的文本越随机；temperature越低，生成的文本越确定
                 # 缩放 logits 并应用 softmax
                 logits = logits / temperature
                 if top_k is not None:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -float('Inf')
-                probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
+                    # top-k采样，限制候选词汇的数量，只保留概率最高的 top_k 个词汇，其他词汇的概率设为0
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))# v存储了logits中最大的k个数值(按从大到小排序)
+                    logits[logits < v[:, [-1]]] = -float('Inf')# [-1]取的是v中的最后一个元素，也就是这k个高分词里得分最低的那个
+                # 多项式采样，赋予生成多样性文本的能力
+                probs = F.softmax(logits, dim=-1)# 将处理后的 logits 转换为概率分布，概率和为1
+                idx_next = torch.multinomial(probs, num_samples=1)# 根据这个概率分布随机抽取1个token，概率越大被选中的可能性越高
             
 
             if idx_next == stop_id:
