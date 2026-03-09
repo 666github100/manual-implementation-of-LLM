@@ -192,7 +192,7 @@ class Attention(nn.Module):
             # 注册为模型的缓冲区，Buffer 中的张量不会计算梯度
             self.register_buffer("mask", mask)
 
-    def forward(self, x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor):
+    def forward(self, x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
         # 获取批次大小和序列长度，[batch_size, seq_len, dim]
         bsz, seqlen, _ = x.shape
 
@@ -215,6 +215,7 @@ class Attention(nn.Module):
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
 
+        key_padding_mask = None
         # 将一维的注意力掩码attention_Mask转换为4维的键填充掩码key_padding_mask,让模型忽略掉填充的无效 token
         if attention_mask is not None:
             key_padding_mask = attention_mask[:, None, None, :].to(dtype=torch.bool)
@@ -222,13 +223,20 @@ class Attention(nn.Module):
 
         # 根据是否支持Flash Attention，选择实现方式。
         if self.flash:
-            # 使用Flash Attention。
-            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+            # 使用Flash Attention
+            if key_padding_mask is not None:
+                causal_mask = torch.ones((seqlen, seqlen), dtype=torch.bool, device=x.device).tril()#创建下三角矩阵，表示因果掩码，确保每个位置只能关注之前的位置
+                full_attn_mask = causal_mask[None, None, :, :] & key_padding_mask # 将因果掩码和键填充掩码按位与，得到完整的注意力掩码，确保每个位置只能关注之前的位置，并且忽略掉填充的无效 token
+                output = torch.nn.functional.scaled_dot_product_attention( xq, xk, xv, attn_mask=full_attn_mask, dropout_p=self.dropout if self.training else 0.0, is_causal=False) # 掩码已经手动包含了因果逻辑，所以这里设为 False
+            else:
+                output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
             # 使用手动实现的注意力机制。
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
             assert hasattr(self, 'mask')
             scores = scores + self.mask[:, :, :seqlen, :seqlen]
+            if key_padding_mask is not None:
+                scores = scores.masked_fill(~key_padding_mask, float("-inf"))#如果存在key_padding_mask，则对无效位置(~key_padding_mask)为True的地方填入−∞
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = torch.matmul(scores, xv)
@@ -294,11 +302,11 @@ class DecoderLayer(nn.Module):
         # 定义前馈神经网络计算的归一化层
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x, freqs_cos, freqs_sin):
+    def forward(self, x, freqs_cos, freqs_sin, attention_mask: Optional[torch.Tensor] = None):
         # 前向传播函数
         # 首先，输入x经过注意力归一化层，然后进行注意力计算，结果与输入x相加得到h
         # 然后，h经过前馈神经网络归一化层，然后进行前馈神经网络计算，结果与h相加得到输出
-        h = x + self.attention.forward(self.attention_norm(x), freqs_cos, freqs_sin)
+        h = x + self.attention.forward(self.attention_norm(x), freqs_cos, freqs_sin, attention_mask=attention_mask)
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
     
@@ -360,6 +368,49 @@ class Transformer(PreTrainedModel):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def _prepare_attention_mask(self, attention_mask: Optional[torch.Tensor], tokens: torch.Tensor) -> Optional[torch.Tensor]:
+        # 掩码清洗与维度对齐,将用户传入的attention_mask标准化为模型内部需要的格式
+        if attention_mask is None:
+            return None
+        if attention_mask.dim() == 4:
+            attention_mask = attention_mask[:, 0, 0, :]
+        elif attention_mask.dim() == 3:
+            attention_mask = attention_mask[:, 0, :]
+        attention_mask = attention_mask.to(tokens.device)#设备同步,确保mask和张量tokens在同一个GPU/CPU上
+        if attention_mask.dtype != torch.bool:
+            attention_mask = attention_mask > 0
+        if attention_mask.shape != tokens.shape:
+            raise ValueError(f"attention_mask shape {attention_mask.shape} must match input_ids shape {tokens.shape}")
+        return attention_mask
+
+    # 执行左填充重排,将输入的token序列根据attention_mask进行左填充，使得模型能够正确处理变长输入
+    def _left_pad_by_attention_mask(
+            self,
+            idx: torch.Tensor,
+            attention_mask: Optional[torch.Tensor],
+            pad_token_id: int
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # 如果没有提供 attention_mask 或者 attention_mask 全为 True，则直接返回原始 idx 和 attention_mask
+        if attention_mask is None or attention_mask.all():
+            return idx, attention_mask
+
+        bsz = idx.size(0)
+        lengths = attention_mask.long().sum(dim=1)# 统计每一行有多少个有效 token
+        max_len = max(int(lengths.max().item()), 1) # 找出 batch 中最长的有效序列长度
+        packed_idx = idx.new_full((bsz, max_len), pad_token_id) # 创建一个新的张量，形状为 (bsz, max_len)，用 pad_token_id 填充
+        packed_mask = attention_mask.new_zeros((bsz, max_len), dtype=torch.bool)
+
+        for row in range(bsz):
+            valid_len = int(lengths[row].item())
+            if valid_len <= 0:
+                continue
+            valid_tokens = idx[row][attention_mask[row]] #提取该行所有有效的token
+            packed_idx[row, max_len - valid_len:] = valid_tokens # 将有效token填充到packed_idx的右侧，左侧用pad_token_id填充
+            packed_mask[row, max_len - valid_len:] = True
+
+        return packed_idx, packed_mask
+    
     
     def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
         """
@@ -375,6 +426,8 @@ class Transformer(PreTrainedModel):
             tokens = kwargs['input_ids']
         if 'labels' in kwargs:
             targets = kwargs['labels']
+        attention_mask = self._prepare_attention_mask(kwargs.get('attention_mask'), tokens)
+
 
         # 前向传播函数
         _bsz, seqlen = tokens.shape
@@ -387,7 +440,7 @@ class Transformer(PreTrainedModel):
 
         # 通过Decoder层
         for layer in self.layers:
-            h = layer(h, freqs_cos, freqs_sin)
+            h = layer(h, freqs_cos, freqs_sin, attention_mask=attention_mask)
         # 通过归一化层
         h = self.norm(h)
 
