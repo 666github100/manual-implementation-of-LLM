@@ -449,12 +449,24 @@ class Transformer(PreTrainedModel):
             logits = self.output(h)
             # F.cross_entropy()对输入数据格式有要求，logits要求(N,C),targets要求(N)
             # 计算交叉熵损失，忽略索引为0的部分，并且不直接返回一个标量（平均损失），而是返回每个 token 位置的损失值
-            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=0, reduction='none')
+            ignore_index = self.args.pad_token_id if self.args.pad_token_id is not None else 0 #确定忽略索引
+            if torch.any(targets == -100):
+                ignore_index = -100 #-100是标准的“忽略标签”
+            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=ignore_index, reduction='none')
         else:
             # 推理时的小优化：只对最后一个位置的输出进行前向传播
-            # 在自回归生成中，只需要根据当前已生成的所有内容来预测下一个token
+            # 在自回归生成中，只需要根据当前已生成的所有内容来预测下一个token 
             # 前面的token对应的logits在推理时是无用的，推理时不需要计算损失
-            logits = self.output(h[:, [-1], :]) 
+            if attention_mask is None:
+                logits = self.output(h[:, [-1], :])
+            else:
+                full_logits = self.output(h)
+                # 计算每个序列最后一个有效 token 的位置索引
+                last_token_pos = attention_mask.long().sum(dim=1).clamp(min=1) - 1
+                # 对每一行(每个样本)的mask求和，因为mask中有效位是1，padding位是0，所以求和结果等于该序列的有效长度
+                # clamp()防御性编程：防止出现全为0的空序列
+                logits = full_logits[torch.arange(_bsz, device=tokens.device), last_token_pos].unsqueeze(1)
+                # 生成batch索引,根据每个序列的最后一个有效 token 的位置索引，从 full_logits 中提取对应位置的 logits，并保持维度一致
             self.last_loss = None
 
         # 设置输出
@@ -464,19 +476,34 @@ class Transformer(PreTrainedModel):
 
     
     @torch.inference_mode() #表示推理模式,在代码块执行期间,临时禁用梯度计算和某些训练时的检查机制,提高运行速度并减少内存占用
-    def generate(self, idx, stop_id=None, max_new_tokens=256, temperature=1.0, top_k=None):
+    def generate(self, idx, stop_id=None, max_new_tokens=256, temperature=1.0, top_k=None, attention_mask: Optional[torch.Tensor] = None,pad_token_id: Optional[int] = None):
         """
         给定输入序列 idx(形状为 (bz,seq_len) 的长整型张量),通过多次生成新token来完成序列。
         在 model.eval() 模式下运行。效率较低的采样版本,没有使用键k/v cache。
         """
+        if pad_token_id is None:
+            pad_token_id = self.args.pad_token_id if self.args.pad_token_id is not None else 0
+        attention_mask = self._prepare_attention_mask(attention_mask, idx)
+        idx, attention_mask = self._left_pad_by_attention_mask(idx, attention_mask, pad_token_id)
+        # 在批量推理中，不同长度的序列必须具有相同的长度才能并行计算。
+        # 训练时：通常使用右填充（Right Padding），因为因果掩码（Causal Mask）只关注过去，右边的 padding 不影响计算。
+        # 生成/推理时：通常强制使用左填充（Left Padding）。
+        # 原因：在自回归生成中，模型每次只预测下一个 token（即序列的最右端）。如果使用右填充，新生成的 token 会落在 padding 区域之后，导致位置编码错乱或需要动态改变序列长度，效率极低。
+        finished = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)# 创建一个布尔张量，用于追踪批次中每个样本是否已经结束生成
+
         index = idx.shape[1]
         for _ in range(max_new_tokens):
             # 如果序列上下文过长，截断它到最大长度，只保留最后max_seq_len个token
             idx_cond = idx if idx.size(1) <= self.args.max_seq_len else idx[:, -self.args.max_seq_len:]
+
+            mask_cond = None
+            if attention_mask is not None:# 超长时优先保留最近的上下文
+                mask_cond = attention_mask if attention_mask.size(1) <= self.args.max_seq_len else attention_mask[:, -self.args.max_seq_len:]
+            
             
             # 前向传播获取序列中最后一个位置的 logits
             # 在 PyTorch 中，直接调用实例 model(input) 等价于调用 model.forward(input)
-            logits = self(idx_cond).logits
+            logits = self(idx_cond, attention_mask=mask_cond).logits
             logits = logits[:, -1, :] # 只保留最后一个时间步的输出
             
             if temperature == 0.0:
@@ -496,10 +523,302 @@ class Transformer(PreTrainedModel):
                 idx_next = torch.multinomial(probs, num_samples=1)# 根据这个概率分布随机抽取1个token，概率越大被选中的可能性越高
             
 
-            if idx_next == stop_id:
-                break
+            prev_finished = finished.clone() # 备份当前状态
+            if stop_id is not None: #检查是否需要处理停止逻辑
+                if prev_finished.any():# 屏蔽已停止样本的输出
+                    fill_token = pad_token_id if pad_token_id is not None else stop_id
+                    idx_next = torch.where(prev_finished[:, None], torch.full_like(idx_next, fill_token), idx_next)
+                finished = prev_finished | idx_next[:, 0].eq(stop_id)# 右半部分标记哪些样本在这一步刚刚结束，合并更新完成状态
+
 
             # 将采样的索引添加到序列中并继续
             idx = torch.cat((idx, idx_next), dim=1)
 
+            if attention_mask is not None:# 更新注意力掩码
+                next_mask = torch.ones((attention_mask.size(0), 1), dtype=attention_mask.dtype, device=attention_mask.device)
+                if prev_finished.any():
+                    next_mask[prev_finished] = False # 对于那些已经结束的样本(prev_finished为True的位置)，将新生成位置的掩码强制设为0(False)
+                attention_mask = torch.cat((attention_mask, next_mask), dim=1)
+
+            if stop_id is not None and finished.all():# 全局终止检查，如果所有样本都已完成生成，则退出循环
+                break
+
         return idx[:, index:] # 只返回生成的token
+    
+    def _greedy_decode(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        贪婪解码,选择概率最大的token
+
+        Args:
+            logits: 模型输出的logits，形状为 (batch_size, vocab_size)
+
+        Returns:
+            选择的token索引，形状为 (batch_size, 1)
+        """
+        _, idx_next = torch.topk(logits, k=1, dim=-1)
+        return idx_next
+
+    def _random_sample(self, logits: torch.Tensor, temperature: float = 1.0, top_k: int = None) -> torch.Tensor:
+        """
+        随机采样,基于概率分布随机选择token
+
+        Args:
+            logits: 模型输出的logits，形状为 (batch_size, vocab_size)
+            temperature: 温度参数，控制随机性
+            top_k: 只考虑概率最高的k个token
+
+        Returns:
+            选择的token索引，形状为 (batch_size, 1)
+        """
+        # 缩放 logits
+        logits = logits / temperature
+
+        # 应用top-k过滤
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            # 将不在 top-k 内的 logits 设为负无穷
+            logits[logits < v[:, [-1]]] = -float('Inf')
+
+        # 计算概率并采样
+        probs = F.softmax(logits, dim=-1)
+        idx_next = torch.multinomial(probs, num_samples=1)
+        return idx_next
+
+    def _beam_search(self, idx: torch.Tensor, max_new_tokens: int, num_beams: int,
+                     temperature: float = 1.0, top_k: int = None, stop_id: int = None) -> torch.Tensor:
+        """
+        束搜索：维护多个候选序列，选择最优路径
+
+        束搜索的核心思想：在每一步生成时，不是只选择一个最佳token，
+        而是保留多个候选路径，最终选择累积概率最高的完整序列。
+
+        Args:
+            idx: 输入序列，形状为 (batch_size, seq_len)
+            max_new_tokens: 最大生成token数量
+            num_beams: 束宽度，表示保留的候选路径数量
+            temperature: 温度参数，控制分布的平滑程度
+            top_k: top-k过滤参数，限制候选token范围
+            stop_id: 停止生成的token ID，遇到则停止
+
+        Returns:
+            生成的token序列，形状为 (batch_size, generated_length)
+            只返回新生成的部分，不包含原始输入序列
+        """
+        # 获取输入序列的基本信息
+        batch_size = idx.shape[0]  # 批次大小，通常为1
+        seq_len = idx.shape[1]     # 输入序列长度
+
+        # 初始化束：创建 num_beams 个候选序列
+        beams = [idx.clone() for _ in range(num_beams)]
+        # 初始化每个候选序列的累积对数概率分数
+        beam_scores = torch.zeros(num_beams, device=idx.device)
+        # 第一个候选是原始输入序列，分数为0
+        beam_scores[0] = 0.0
+        # 其他候选初始分数设为负无穷，表示尚未生成
+        beam_scores[1:] = float('-inf')
+
+        # 主循环：逐步生成新的token，最多生成 max_new_tokens 个
+        for step in range(max_new_tokens):
+            # 每轮迭代收集新的候选序列和分数
+            new_beams = []   # 新的候选序列列表
+            new_scores = []  # 对应的分数列表
+
+            # 遍历当前的所有候选序列
+            for beam_idx, beam in enumerate(beams):
+                # 跳过无效候选（分数为负无穷的序列）
+                if beam_scores[beam_idx] == float('-inf'):
+                    continue
+
+                # 序列长度检查：如果超过最大长度，截取最后的部分
+                beam_cond = beam if beam.size(1) <= self.args.max_seq_len else beam[:, -self.args.max_seq_len:]
+
+                # 前向传播：获取模型对当前序列的预测
+                output = self(beam_cond)
+                # 提取最后一个位置的logits，用于预测下一个token
+                logits = output.logits[:, -1, :]  # 形状: (1, vocab_size)
+
+                # 温度缩放：调整logits的分布
+                if temperature != 1.0:
+                    logits = logits / temperature
+                    # 温度 > 1：分布更平滑，增加随机性
+                    # 温度 < 1：分布更尖锐，更确定
+
+                # Top-k过滤：限制候选token的范围，提高质量
+                if top_k is not None:
+                    # 找到logits中前top_k个最大的值
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    # 将不在前top_k内的logits设为负无穷
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                    # 这样采样时只会考虑前top_k个token
+
+                # 计算对数概率：使用log_softmax避免数值不稳定
+                log_probs = F.log_softmax(logits, dim=-1)
+
+                # 获取前 num_beams 个最可能的候选token
+                # 注意：这里的top-k与上面的top-k不同
+                # 上面的top-k是全局过滤，这里是束搜索的分支选择
+                top_log_probs, top_indices = torch.topk(log_probs, k=num_beams, dim=-1)
+
+                # 为当前候选序列生成 num_beams 个扩展序列
+                for k in range(num_beams):
+                    # 选择第k个候选token
+                    token = top_indices[:, k:k+1]      # token ID
+                    log_prob = top_log_probs[:, k]     # 对应的对数概率
+
+                    # 扩展序列：将新token添加到当前序列末尾
+                    new_beam = torch.cat([beam, token], dim=1)
+                    # 更新累积分数：原序列分数 + 新token的对数概率
+                    new_score = beam_scores[beam_idx] + log_prob.item()
+
+                    # 保存新的候选序列和分数
+                    new_beams.append(new_beam)
+                    new_scores.append(new_score)
+
+            # 安全检查：如果没有生成任何有效候选，提前结束
+            if not new_beams:
+                break
+
+            # 筛选最佳候选：从所有新生成的候选中选择分数最高的 num_beams 个
+            # 按分数降序排序，获取索引
+            sorted_indices = sorted(range(len(new_scores)), key=lambda i: new_scores[i], reverse=True)
+            # 选择前 num_beams 个最佳候选
+            beams = [new_beams[i] for i in sorted_indices[:num_beams]]
+            beam_scores = [new_scores[i] for i in sorted_indices[:num_beams]]
+
+            # 停止条件检查：检查最佳序列是否以停止token结尾
+            if stop_id is not None and beams[0][0, -1] == stop_id:
+                break
+
+        # 返回得分最高的序列，只返回新生成的部分（去掉原始输入）
+        # beams[0] 是最终得分最高的完整序列
+        # [:, seq_len:] 切片只保留生成部分
+        return beams[0][:, seq_len:]
+
+    @torch.inference_mode()
+    def generate_super(self,
+                       idx,
+                       stop_id=None,
+                       max_new_tokens=256,
+                       temperature=1.0,
+                       top_k=None,
+                       do_sample=False,
+                       num_beams=1,
+                       attention_mask: Optional[torch.Tensor] = None,
+                       pad_token_id: Optional[int] = None
+                       ):
+        """
+        高级文本生成函数，支持三种解码策略：
+
+        1. 贪婪解码（Greedy Search）：
+           - 参数：do_sample=False, num_beams=1
+           - 特点：每步选择概率最大的token，速度快、结果确定
+
+        2. 随机采样（Random Sampling）：
+           - 参数：do_sample=True, num_beams=1
+           - 特点：基于概率分布随机采样，可配合temperature和top-k控制多样性
+
+        3. 束搜索（Beam Search）：
+           - 参数：do_sample=False, num_beams>1
+           - 特点：维护多条候选路径，选择总概率最高的序列，质量更高但速度较慢
+
+        Args:
+            idx: 输入序列张量，形状为 (batch_size, seq_len)
+            stop_id: 停止生成的token ID
+            max_new_tokens: 最大生成token数量
+            temperature: 温度参数，控制随机性，越高越随机
+            top_k: 只考虑概率最高的k个token，None表示不考虑
+            do_sample: 是否使用随机采样，False时使用确定性解码
+            num_beams: 束搜索的束宽度，1表示不使用束搜索
+
+        Returns:
+            生成的token序列，形状为 (batch_size, generated_length)
+        """
+        # 参数验证
+        if temperature <= 0:
+            temperature = 0.001  # 避免除零错误
+        if num_beams < 1:
+            num_beams = 1
+        if top_k is not None and top_k < 1:
+            top_k = None
+        if pad_token_id is None:
+            pad_token_id = self.args.pad_token_id if self.args.pad_token_id is not None else 0
+        attention_mask = self._prepare_attention_mask(attention_mask, idx)
+        idx, attention_mask = self._left_pad_by_attention_mask(idx, attention_mask, pad_token_id)
+
+        # 束搜索逻辑
+        if not do_sample and num_beams > 1:
+            return self._beam_search(idx, max_new_tokens, num_beams, temperature, top_k, stop_id)
+
+        # 贪婪解码和随机采样逻辑
+        finished = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
+        index = idx.shape[1]
+        for _ in range(max_new_tokens):
+            # 如果序列上下文过长，截断它到最大长度
+            idx_cond = idx if idx.size(1) <= self.args.max_seq_len else idx[:, -self.args.max_seq_len:]
+            mask_cond = None
+            if attention_mask is not None:
+                mask_cond = attention_mask if attention_mask.size(1) <= self.args.max_seq_len else attention_mask[:, -self.args.max_seq_len:]
+
+            # 前向传播获取序列中最后一个位置的 logits
+            logits = self(idx_cond, attention_mask=mask_cond).logits
+            logits = logits[:, -1, :] # 只保留最后一个时间步的输出
+
+            # 根据参数选择解码策略
+            if do_sample:
+                idx_next = self._random_sample(logits, temperature, top_k)
+            else:
+                # 当temperature=0时使用贪婪解码
+                if temperature < 0.1:
+                    idx_next = self._greedy_decode(logits)
+                else:
+                    # 低温度下的随机采样（接近贪婪）
+                    idx_next = self._random_sample(logits, temperature, top_k)
+
+            prev_finished = finished.clone()
+            if stop_id is not None:
+                if prev_finished.any():
+                    fill_token = pad_token_id if pad_token_id is not None else stop_id
+                    idx_next = torch.where(prev_finished[:, None], torch.full_like(idx_next, fill_token), idx_next)
+                finished = prev_finished | idx_next[:, 0].eq(stop_id)
+
+            # 将选择的token添加到序列中
+            idx = torch.cat((idx, idx_next), dim=1)
+            if attention_mask is not None:
+                next_mask = torch.ones((attention_mask.size(0), 1), dtype=attention_mask.dtype, device=attention_mask.device)
+                if prev_finished.any():
+                    next_mask[prev_finished] = False
+                attention_mask = torch.cat((attention_mask, next_mask), dim=1)
+
+            if stop_id is not None and finished.all():
+                break
+
+        return idx[:, index:] # 只返回生成的token
+
+if __name__ == '__main__':
+    tokenizer = AutoTokenizer.from_pretrained("tokenizer_k")
+    args = ModelConfig(
+        dim=1024,
+        n_layers=18,
+        pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
+    )
+    # 实例化LLaMA2Model
+    model = Transformer(args=args)
+    # 计算model的全部参数
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f'LLM总参数量：{num_params / 1e6:.3f} 百万')
+
+    prompt = "你好呀，近来如何呢？"
+    text = f"{tokenizer.bos_token}{prompt}{tokenizer.eos_token}"
+    print(f"Input text: {text}")
+
+    input_id = tokenizer(text).data['input_ids']
+    print("input_ids :", input_id)
+    print("dcode_str :", tokenizer.decode(input_id))
+
+    X = torch.tensor(input_id[:-1]).unsqueeze(0)
+    Y = torch.tensor(input_id[1:]).unsqueeze(0)
+    print("X shape :", X.shape)
+    print("Y shape :", Y.shape)
+
+    # 将输入张量传入模型
+    output = model(X, Y)
